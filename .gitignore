@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Large training artifacts
+checkpoints/
+train_logs/
+
+# Virtual environments
+venv/
+.venv/
+

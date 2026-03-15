@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import os
 import numpy as np
 import torch
 
@@ -25,12 +26,15 @@ from mesh import (
     make_quad_grid,
     make_open_box,
     make_semicircle_tri,
+    make_hemisphere_tri,
+    load_obj,
     get_all_edges,
     compute_edge_energy_np,
     compute_quad_area_energy_np,
     compute_planarity_energy_np,
     compute_flatness_penalty_np,
     compute_max_z_deviation_np,
+    compute_diag_planarity_metric_np,
 )
 from train import SubspaceDecoder
 
@@ -115,13 +119,29 @@ def main():
         k_xy = checkpoint.get("k_xy", "?")
         k_z = checkpoint.get("k_z", "?")
         print(f"  k_xy={k_xy}, k_z={k_z}")
+    w_diag_planarity = checkpoint.get("w_diag_planarity", None)
+    if w_diag_planarity is not None and w_diag_planarity != 0:
+        print(f"  w_diag_planarity={w_diag_planarity}")
 
     # --- Mesh setup ---
     bottom_lip_mask = None
-    if mesh_type == "box":
+    mesh_file = checkpoint.get("mesh_file")
+    if mesh_file:
+        # Resolve path: try as-is, then relative to checkpoint dir, then cwd
+        mesh_path = os.path.expanduser(mesh_file)
+        if not os.path.isfile(mesh_path):
+            for base in [os.path.dirname(os.path.abspath(args.model)), os.getcwd()]:
+                candidate = os.path.join(base, os.path.basename(mesh_path))
+                if os.path.isfile(candidate):
+                    mesh_path = candidate
+                    break
+        vertices_rest, faces, interior_mask, bottom_lip_mask = load_obj(mesh_path)
+    elif mesh_type == "box":
         vertices_rest, faces, interior_mask, bottom_lip_mask = make_open_box(2)
     elif mesh_type == "semiTri":
         vertices_rest, faces, interior_mask = make_semicircle_tri()
+    elif mesh_type == "hemiTri":
+        vertices_rest, faces, interior_mask, bottom_lip_mask = make_hemisphere_tri()
     else:
         vertices_rest, faces, interior_mask = make_quad_grid(4, 4)
 
@@ -131,13 +151,20 @@ def main():
     rest_lengths = np.linalg.norm(
         vertices_rest[edges[:, 1]] - vertices_rest[edges[:, 0]], axis=1
     )
-    # Compute actual rest areas per face
+    # Compute actual rest areas per face (tris or quads)
     rest_areas_list = []
     for face in faces:
-        v0, v1, v2, v3 = vertices_rest[face]
-        a1 = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
-        a2 = 0.5 * np.linalg.norm(np.cross(v2 - v0, v3 - v0))
-        rest_areas_list.append(a1 + a2)
+        if len(face) == 4:
+            v0, v1, v2, v3 = vertices_rest[face]
+            a1 = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+            a2 = 0.5 * np.linalg.norm(np.cross(v2 - v0, v3 - v0))
+            rest_areas_list.append(a1 + a2)
+        elif len(face) == 3:
+            v0, v1, v2 = vertices_rest[face]
+            a = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+            rest_areas_list.append(a)
+        else:
+            raise ValueError(f"Unsupported face size {len(face)} when computing rest areas")
     rest_areas = np.array(rest_areas_list, dtype=np.float64)
 
     interior_indices = np.where(interior_mask)[0]
@@ -191,6 +218,8 @@ def main():
         "wall_height": 2.0,
         "show_floor": False,
         "floor_color": (0.3, 0.7, 0.3),
+        "show_diag_planarity": False,
+        "diag_relative": True,  # normalize to current max by default
     }
 
     # --- Decode function ---
@@ -225,8 +254,9 @@ def main():
         "stiffFree3d": "Stiff-Free3D",
     }
     mode_label = mode_labels.get(mode, mode)
-    if mesh_type != "grid":
-        mode_label = f"[{mesh_type}] {mode_label}"
+    if mesh_type != "grid" or mesh_file:
+        mesh_label = os.path.basename(mesh_file) if mesh_file else mesh_type
+        mode_label = f"[{mesh_label}] {mode_label}"
     if mode == "stiffFree3d":
         mode_label += f" (kxy={checkpoint.get('k_xy','?')}, kz={checkpoint.get('k_z','?')})"
 
@@ -236,7 +266,9 @@ def main():
     ps.set_ground_plane_mode("none")
     ps.set_background_color(viz_state["bg_color"])
 
-    ps.set_build_gui(False)
+    # Enable Polyscope's built-in GUI so scalar quantities (like planarity)
+    # show a colorbar/key on the right. Keep our own ImGui windows via callback.
+    ps.set_build_gui(True)
     ps.set_open_imgui_window_for_user_callback(False)
 
     # Face mesh (transparency applies here only)
@@ -264,6 +296,9 @@ def main():
     # Freeze scene extents so walls/floor don't bloat the bounding box
     # (which would shrink auto-scaled vertex/edge sizes).
     ps.set_automatically_compute_scene_extents(False)
+
+    # Optional face-based diagonal planarity quantity (initialized later on demand)
+    diag_planarity_quantity = None
 
     # Roof mode: walls mesh (grid only — box mesh is already a box)
     walls_ps = None
@@ -350,10 +385,10 @@ def main():
         first = viz_state["first_frame"]
 
         # =============================================================
-        # TOP-LEFT: Latent sliders
+        # TOP: Latent sliders (shifted right so Polyscope panel has room on the left)
         # =============================================================
         if first:
-            psim.SetNextWindowPos((10.0, 10.0))
+            psim.SetNextWindowPos((360.0, 10.0))
             psim.SetNextWindowSize((320.0, 0.0))
         _, _ = psim.Begin(f"Latent Space (d={latent_dim})", True)
 
@@ -407,10 +442,10 @@ def main():
         psim.End()
 
         # =============================================================
-        # BOTTOM-LEFT: Appearance controls
+        # BOTTOM: Appearance controls (also shifted right)
         # =============================================================
         if first:
-            psim.SetNextWindowPos((10.0, 400.0))
+            psim.SetNextWindowPos((360.0, 400.0))
             psim.SetNextWindowSize((320.0, 0.0))
         _, _ = psim.Begin("Appearance", True)
 
@@ -525,6 +560,54 @@ def main():
             viz_state["bg_color"] = new_bg
             ps.set_background_color(new_bg)
 
+        psim.Separator()
+
+        # Toggle diagonal-based planarity heatmap (quads only)
+        if faces.shape[1] == 4:
+            c_dp, new_dp = psim.Checkbox("Show diag planarity (%)", viz_state["show_diag_planarity"])
+            if c_dp:
+                viz_state["show_diag_planarity"] = new_dp
+                nonlocal diag_planarity_quantity
+                if new_dp:
+                    metrics_pct = compute_diag_planarity_metric_np(vertices, faces)
+                    metrics_abs = np.clip(metrics_pct / 100.0, 0.0, 1.0)
+                    if viz_state["diag_relative"]:
+                        # Relative scale with a minimum window of [0, 0.5] in absolute units.
+                        mmax = float(metrics_abs.max())
+                        denom = max(mmax, 0.5)
+                        metrics = metrics_abs / denom if denom > 1e-8 else metrics_abs
+                    else:
+                        metrics = metrics_abs
+                    diag_planarity_quantity = mesh_ps.add_scalar_quantity(
+                        "diag_planarity",
+                        metrics,
+                        defined_on="faces",
+                        vminmax=(0.0, 1.0),
+                        cmap="viridis",
+                        enabled=True,
+                    )
+                elif diag_planarity_quantity is not None:
+                    # Turn off the scalar quantity and restore the base face color.
+                    diag_planarity_quantity.set_enabled(False)
+                    mesh_ps.set_color(viz_state["mesh_color"])
+                    mesh_ps.set_material(MATERIALS[viz_state["material_idx"]])
+
+            # Toggle normalization mode for heatmap (relative vs absolute)
+            c_nr, new_nr = psim.Checkbox("Normalize diag heatmap", viz_state["diag_relative"])
+            if c_nr:
+                viz_state["diag_relative"] = new_nr
+                # If quantity already exists and is enabled, recompute with new scaling
+                if viz_state["show_diag_planarity"] and diag_planarity_quantity is not None:
+                    metrics_pct = compute_diag_planarity_metric_np(vertices, faces)
+                    metrics_abs = np.clip(metrics_pct / 100.0, 0.0, 1.0)
+                    if viz_state["diag_relative"]:
+                        mmax = float(metrics_abs.max())
+                        denom = max(mmax, 0.5)
+                        metrics = metrics_abs / denom if denom > 1e-8 else metrics_abs
+                    else:
+                        metrics = metrics_abs
+                    diag_planarity_quantity.update_values(metrics)
+
         psim.End()
 
         # =============================================================
@@ -537,6 +620,26 @@ def main():
             cloud.update_point_positions(vertices)
             if roof_supported and viz_state["roof_mode"]:
                 update_walls()
+            if viz_state["show_diag_planarity"] and faces.shape[1] == 4:
+                metrics_pct = compute_diag_planarity_metric_np(vertices, faces)
+                metrics_abs = np.clip(metrics_pct / 100.0, 0.0, 1.0)
+                if viz_state["diag_relative"]:
+                    mmax = float(metrics_abs.max())
+                    denom = max(mmax, 0.5)
+                    metrics = metrics_abs / denom if denom > 1e-8 else metrics_abs
+                else:
+                    metrics = metrics_abs
+                if diag_planarity_quantity is None:
+                    diag_planarity_quantity = mesh_ps.add_scalar_quantity(
+                        "diag_planarity",
+                        metrics,
+                        defined_on="faces",
+                        vminmax=(0.0, 1.0),
+                        cmap="viridis",
+                        enabled=True,
+                    )
+                else:
+                    diag_planarity_quantity.update_values(metrics)
 
         viz_state["first_frame"] = False
 

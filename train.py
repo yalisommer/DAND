@@ -32,10 +32,16 @@ from mesh import (
     make_quad_grid,
     make_open_box,
     make_semicircle_tri,
+    make_hemisphere_tri,
+    load_obj,
     get_all_edges,
     compute_edge_energy_torch,
     compute_quad_area_energy_torch,
     compute_planarity_energy_torch,
+    compute_diag_planarity_energy_torch,
+    compute_diag_planarity_energy_torch_old,
+    compute_edge_inequality_10_torch,
+    compute_mesh_width_height_torch,
     assemble_vertices_torch,
 )
 
@@ -119,8 +125,32 @@ def potential_energy_free(pred_batch, edges, rest_lengths, faces, rest_areas,
     return torch.stack(energies)
 
 
+def _optional_penalty_terms(all_verts, edges, rest_lengths, faces,
+                            w_inverse_diag=0.0, w_edge_length=0.0,
+                            w_edge_inequality_10=0.0, w_width=0.0, w_height=0.0):
+    """Compute optional penalty/additive terms (inverse_diag, edge_length, edge_ineq, width/height)."""
+    extra = 0.0
+    if w_inverse_diag > 0.0:
+        # Inverse diag: discourage planarity (encourage warped quads). loss += -w * e_diag → minimize -e_diag → maximize e_diag
+        e_diag = compute_diag_planarity_energy_torch(all_verts, faces)
+        extra = extra - w_inverse_diag * e_diag
+    if w_edge_length > 0.0:
+        extra = extra + w_edge_length * compute_edge_energy_torch(all_verts, edges, rest_lengths)
+    if w_edge_inequality_10 > 0.0:
+        extra = extra + w_edge_inequality_10 * compute_edge_inequality_10_torch(
+            all_verts, edges, rest_lengths
+        )
+    if w_width > 0.0 or w_height > 0.0:
+        width, height = compute_mesh_width_height_torch(all_verts)
+        extra = extra - w_width * width - w_height * height
+    return extra
+
+
 def potential_energy_free3d(pred_batch, edges, rest_lengths, faces, rest_areas,
-                            w_edge=1.0, w_area=0.5, w_planarity=10.0):
+                            w_edge=1.0, w_area=0.5, w_planarity=10.0,
+                            w_diag_planarity=0.0,
+                            w_inverse_diag=0.0, w_edge_length=0.0,
+                            w_edge_inequality_10=0.0, w_width=0.0, w_height=0.0):
     """Potential energy for FREE3D mode (3D with volumetric planarity penalty)."""
     B = pred_batch.shape[0]
     energies = []
@@ -129,12 +159,27 @@ def potential_energy_free3d(pred_batch, edges, rest_lengths, faces, rest_areas,
         e_edge = compute_edge_energy_torch(all_verts, edges, rest_lengths)
         e_area = compute_quad_area_energy_torch(all_verts, faces, rest_areas)
         e_planar = compute_planarity_energy_torch(all_verts, faces)
-        energies.append(w_edge * e_edge + w_area * e_area + w_planarity * e_planar)
+        e_diag = compute_diag_planarity_energy_torch(all_verts, faces) if w_diag_planarity > 0.0 else 0.0
+        extra = _optional_penalty_terms(
+            all_verts, edges, rest_lengths, faces,
+            w_inverse_diag=w_inverse_diag, w_edge_length=w_edge_length,
+            w_edge_inequality_10=w_edge_inequality_10, w_width=w_width, w_height=w_height,
+        )
+        energies.append(
+            w_edge * e_edge
+            + w_area * e_area
+            + w_planarity * e_planar
+            + w_diag_planarity * e_diag
+            + extra
+        )
     return torch.stack(energies)
 
 
 def potential_energy_stiff3d(pred_batch, q_seed, edges, rest_lengths, faces, rest_areas,
-                             w_edge=1.0, w_area=0.5, k_xy=1.0, k_z=1.0):
+                             w_edge=1.0, w_area=0.5, k_xy=1.0, k_z=1.0,
+                             w_diag_planarity=0.0,
+                             w_inverse_diag=0.0, w_edge_length=0.0,
+                             w_edge_inequality_10=0.0, w_width=0.0, w_height=0.0):
     """
     Potential energy for STIFFFREE3D mode with anisotropic displacement springs.
     E = edge + area + k_xy·Σ(Δxᵢ²+Δyᵢ²) + k_z·Σzᵢ²
@@ -152,10 +197,54 @@ def potential_energy_stiff3d(pred_batch, q_seed, edges, rest_lengths, faces, res
         all_verts = pred_batch[i].view(-1, 3)
         e_edge = compute_edge_energy_torch(all_verts, edges, rest_lengths)
         e_area = compute_quad_area_energy_torch(all_verts, faces, rest_areas)
+        e_diag = compute_diag_planarity_energy_torch(all_verts, faces) if w_diag_planarity > 0.0 else 0.0
         disp = all_verts - rest_verts
         e_xy = torch.sum(disp[:, :2] ** 2)
         e_z = torch.sum(disp[:, 2] ** 2)
-        energies.append(w_edge * e_edge + w_area * e_area + k_xy * e_xy + k_z * e_z)
+        extra = _optional_penalty_terms(
+            all_verts, edges, rest_lengths, faces,
+            w_inverse_diag=w_inverse_diag, w_edge_length=w_edge_length,
+            w_edge_inequality_10=w_edge_inequality_10, w_width=w_width, w_height=w_height,
+        )
+        energies.append(
+            w_edge * e_edge
+            + w_area * e_area
+            + k_xy * e_xy
+            + k_z * e_z
+            + w_diag_planarity * e_diag
+            + extra
+        )
+    return torch.stack(energies)
+
+
+def potential_energy_old_diag(pred_batch, edges, rest_lengths, faces, rest_areas,
+                              w_edge=1.0, w_area=0.5, w_old_diag=1.0,
+                              w_inverse_diag=0.0, w_edge_length=0.0,
+                              w_edge_inequality_10=0.0, w_width=0.0, w_height=0.0):
+    """
+    Experimental mode: 3D free mesh with the ORIGINAL diagonal-based planarity
+    energy (using the line–line distance formula).
+
+    E = edge + area + w_old_diag · Σ m_old_diag(f)²
+    """
+    B = pred_batch.shape[0]
+    energies = []
+    for i in range(B):
+        all_verts = pred_batch[i].view(-1, 3)
+        e_edge = compute_edge_energy_torch(all_verts, edges, rest_lengths)
+        e_area = compute_quad_area_energy_torch(all_verts, faces, rest_areas)
+        e_diag_old = compute_diag_planarity_energy_torch_old(all_verts, faces)
+        extra = _optional_penalty_terms(
+            all_verts, edges, rest_lengths, faces,
+            w_inverse_diag=w_inverse_diag, w_edge_length=w_edge_length,
+            w_edge_inequality_10=w_edge_inequality_10, w_width=w_width, w_height=w_height,
+        )
+        energies.append(
+            w_edge * e_edge
+            + w_area * e_area
+            + w_old_diag * e_diag_old
+            + extra
+        )
     return torch.stack(energies)
 
 
@@ -198,8 +287,14 @@ def train(args):
     # --- Mesh setup ---
     disp_mask = None  # displacement mask for frozen DOFs (None = all free)
     bottom_lip_mask_np = None
+    mesh_file_path = getattr(args, "mesh_file", None)
 
-    if mesh_type == "grid":
+    if mesh_file_path:
+        if mode in ("anchored", "free"):
+            raise ValueError(f"Mode '{mode}' is not supported for OBJ mesh (use free3d or stiffFree3d)")
+        vertices_rest, faces_np, interior_mask, bottom_lip_mask_np = load_obj(mesh_file_path)
+        mesh_type = "obj"
+    elif mesh_type == "grid":
         vertices_rest, faces_np, interior_mask = make_quad_grid(4, 4)
     elif mesh_type == "box":
         if mode in ("anchored", "free"):
@@ -209,6 +304,10 @@ def train(args):
         if mode in ("anchored", "free"):
             raise ValueError(f"Mode '{mode}' is not supported for semiTri mesh (use free3d or stiffFree3d)")
         vertices_rest, faces_np, interior_mask = make_semicircle_tri()
+    elif mesh_type == "hemiTri":
+        if mode in ("anchored", "free"):
+            raise ValueError(f"Mode '{mode}' is not supported for hemiTri mesh (use free3d or stiffFree3d)")
+        vertices_rest, faces_np, interior_mask, bottom_lip_mask_np = make_hemisphere_tri()
     else:
         raise ValueError(f"Unknown mesh type: {mesh_type}")
 
@@ -242,7 +341,7 @@ def train(args):
             raise ValueError(f"Unsupported face size {len(face)} when computing rest areas")
     rest_areas = torch.tensor(rest_areas_list, dtype=torch.float32, device=device)
 
-    # Build displacement mask for box mesh (freeze z-component of bottom lip)
+    # Build displacement mask for meshes with anchored bottom lip (box / hemisphere)
     if bottom_lip_mask_np is not None:
         mask_np = np.ones(num_verts * 3, dtype=np.float32)
         lip_indices = np.where(bottom_lip_mask_np)[0]
@@ -250,7 +349,8 @@ def train(args):
             mask_np[idx * 3 + 2] = 0.0  # zero out z-component
         disp_mask = torch.from_numpy(mask_np).to(device)
         num_frozen = int(bottom_lip_mask_np.sum())
-        print(f"  Box mesh: {num_verts} verts, {num_frozen} bottom-lip (z frozen), "
+        mesh_label = "OBJ" if mesh_type == "obj" else "Box"
+        print(f"  {mesh_label} mesh: {num_verts} verts, {num_frozen} bottom-lip (z frozen), "
               f"{num_verts - num_frozen} fully free")
 
     # --- Mode-specific setup ---
@@ -283,6 +383,19 @@ def train(args):
         ).float().to(device)
         print(f"  Free3D: {num_verts} vertices, {output_dim} DOF (3D)")
         print(f"  w_planarity={args.w_planarity}")
+        if getattr(args, "w_diag_planarity", 0.0) > 0.0:
+            print(f"  w_diag_planarity={args.w_diag_planarity}")
+
+    elif mode == "old_diag_penalty":
+        # Same DOFs as free3d, but uses the original diagonal planarity energy only.
+        output_dim = num_verts * 3
+        interior_indices = None
+        boundary_xy = None
+        q_seed = torch.from_numpy(
+            vertices_rest.flatten()
+        ).float().to(device)
+        print(f"  OldDiagPenalty (3D): {num_verts} vertices, {output_dim} DOF (3D)")
+        print(f"  w_old_diag={args.w_diag_planarity}")
 
     elif mode == "stiffFree3d":
         output_dim = num_verts * 3
@@ -293,9 +406,23 @@ def train(args):
         ).float().to(device)
         print(f"  StiffFree3D: {num_verts} vertices, {output_dim} DOF (3D)")
         print(f"  k_xy={args.k_xy}, k_z={args.k_z} (ratio k_z/k_xy={args.k_z/args.k_xy:.2f})")
+        if getattr(args, "w_diag_planarity", 0.0) > 0.0:
+            print(f"  w_diag_planarity={args.w_diag_planarity}")
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
+
+    # Optional penalty weights (any 3D mode)
+    if getattr(args, "w_inverse_diag", 0.0) > 0.0:
+        print(f"  w_inverse_diag={args.w_inverse_diag}")
+    if getattr(args, "w_edge_length", 0.0) > 0.0:
+        print(f"  w_edge_length={args.w_edge_length}")
+    if getattr(args, "w_edge_inequality_10", 0.0) > 0.0:
+        print(f"  w_edge_inequality_10={args.w_edge_inequality_10}")
+    if getattr(args, "w_width", 0.0) > 0.0:
+        print(f"  w_width={args.w_width}")
+    if getattr(args, "w_height", 0.0) > 0.0:
+        print(f"  w_height={args.w_height}")
 
     # --- Model (same architecture for all modes) ---
     model = SubspaceDecoder(
@@ -346,12 +473,37 @@ def train(args):
         elif mode == "free3d":
             e_pot = potential_energy_free3d(
                 f_z, edges, rest_lengths, faces, rest_areas,
-                w_edge=1.0, w_area=0.5, w_planarity=args.w_planarity,
+                w_edge=1.0, w_area=0.5,
+                w_planarity=args.w_planarity,
+                w_diag_planarity=getattr(args, "w_diag_planarity", 0.0),
+                w_inverse_diag=getattr(args, "w_inverse_diag", 0.0),
+                w_edge_length=getattr(args, "w_edge_length", 0.0),
+                w_edge_inequality_10=getattr(args, "w_edge_inequality_10", 0.0),
+                w_width=getattr(args, "w_width", 0.0),
+                w_height=getattr(args, "w_height", 0.0),
+            )
+        elif mode == "old_diag_penalty":
+            e_pot = potential_energy_old_diag(
+                f_z, edges, rest_lengths, faces, rest_areas,
+                w_edge=1.0, w_area=0.5,
+                w_old_diag=getattr(args, "w_diag_planarity", 1.0),
+                w_inverse_diag=getattr(args, "w_inverse_diag", 0.0),
+                w_edge_length=getattr(args, "w_edge_length", 0.0),
+                w_edge_inequality_10=getattr(args, "w_edge_inequality_10", 0.0),
+                w_width=getattr(args, "w_width", 0.0),
+                w_height=getattr(args, "w_height", 0.0),
             )
         else:  # stiffFree3d
             e_pot = potential_energy_stiff3d(
                 f_z, q_seed, edges, rest_lengths, faces, rest_areas,
-                w_edge=1.0, w_area=0.5, k_xy=args.k_xy, k_z=args.k_z,
+                w_edge=1.0, w_area=0.5,
+                k_xy=args.k_xy, k_z=args.k_z,
+                w_diag_planarity=getattr(args, "w_diag_planarity", 0.0),
+                w_inverse_diag=getattr(args, "w_inverse_diag", 0.0),
+                w_edge_length=getattr(args, "w_edge_length", 0.0),
+                w_edge_inequality_10=getattr(args, "w_edge_inequality_10", 0.0),
+                w_width=getattr(args, "w_width", 0.0),
+                w_height=getattr(args, "w_height", 0.0),
             )
         loss_energy = e_pot.mean()
 
@@ -411,11 +563,25 @@ def train(args):
         "lam": args.lam,
         "w_anchor": args.w_anchor,
     }
+    if mesh_file_path:
+        save_dict["mesh_file"] = os.path.abspath(mesh_file_path)
     if mode == "free3d":
         save_dict["w_planarity"] = args.w_planarity
     if mode == "stiffFree3d":
         save_dict["k_xy"] = args.k_xy
         save_dict["k_z"] = args.k_z
+        if getattr(args, "w_diag_planarity", 0.0) > 0.0:
+            save_dict["w_diag_planarity"] = args.w_diag_planarity
+        if getattr(args, "w_inverse_diag", 0.0) > 0.0:
+            save_dict["w_inverse_diag"] = args.w_inverse_diag
+        if getattr(args, "w_edge_length", 0.0) > 0.0:
+            save_dict["w_edge_length"] = args.w_edge_length
+        if getattr(args, "w_edge_inequality_10", 0.0) > 0.0:
+            save_dict["w_edge_inequality_10"] = args.w_edge_inequality_10
+        if getattr(args, "w_width", 0.0) > 0.0:
+            save_dict["w_width"] = args.w_width
+        if getattr(args, "w_height", 0.0) > 0.0:
+            save_dict["w_height"] = args.w_height
     torch.save(save_dict, model_path)
     print(f"Model saved to {model_path}")
 
@@ -423,6 +589,35 @@ def train(args):
     with open(log_path, "w") as f:
         json.dump(losses_log, f, indent=2)
     print(f"Training log saved to {log_path}")
+
+    # Optional loss plots
+    if getattr(args, "plot_loss", False):
+        try:
+            import matplotlib.pyplot as plt
+            steps = [e["step"] for e in losses_log]
+            total_loss = [e["loss"] for e in losses_log]
+            energy_loss = [e["loss_energy"] for e in losses_log]
+            metric_loss = [e["loss_metric"] for e in losses_log]
+            anchor_loss = [e["loss_anchor"] for e in losses_log]
+
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(steps, total_loss, label="total loss")
+            ax.plot(steps, energy_loss, label="energy")
+            ax.plot(steps, metric_loss, label="metric")
+            ax.plot(steps, anchor_loss, label="anchor")
+            ax.set_xlabel("step")
+            ax.set_ylabel("loss")
+            ax.set_title("Training loss breakdown")
+            ax.legend()
+            ax.grid(True, alpha=0.2)
+            fig.tight_layout()
+
+            plot_path = os.path.join(args.output_dir, "loss_plot.png")
+            fig.savefig(plot_path, dpi=150)
+            plt.close(fig)
+            print(f"Loss plot saved to {plot_path}")
+        except Exception as e:
+            print(f"Could not generate loss plot: {e}")
 
 
 # =============================================================================
@@ -434,13 +629,14 @@ if __name__ == "__main__":
 
     # Mesh
     parser.add_argument("--mesh", type=str, default="grid",
-                        choices=["grid", "box", "semiTri"],
-                        help="Mesh type: 'grid' (flat 4x4), 'box' (open cube, n=2), "
-                             "or 'semiTri' (triangulated semicircle fan)")
+                        choices=["grid", "box", "semiTri", "hemiTri"],
+                        help="Mesh type (ignored if --mesh_file is set): 'grid', 'box', 'semiTri', 'hemiTri'")
+    parser.add_argument("--mesh_file", type=str, default=None,
+                        help="Path to OBJ file for generic mesh loading (use free3d or stiffFree3d mode)")
 
     # Mode
     parser.add_argument("--mode", type=str, default="anchored",
-                        choices=["anchored", "free", "free3d", "stiffFree3d"],
+                        choices=["anchored", "free", "free3d", "stiffFree3d", "old_diag_penalty"],
                         help="Training mode")
 
     # Model
@@ -463,6 +659,18 @@ if __name__ == "__main__":
     # Free3D-specific
     parser.add_argument("--w_planarity", type=float, default=10.0,
                         help="Planarity penalty weight (higher = flatter mesh)")
+    parser.add_argument("--w_diag_planarity", type=float, default=0.0,
+                        help="Additional diagonal-based planarity weight (quad meshes only)")
+    parser.add_argument("--w_inverse_diag", type=float, default=0.0,
+                        help="Discourage diagonal planarity (encourage warped quads: loss -= w*e_diag)")
+    parser.add_argument("--w_edge_length", type=float, default=0.0,
+                        help="Extra penalty on edge length change vs rest (mean (L-L0)²)")
+    parser.add_argument("--w_edge_inequality_10", type=float, default=0.0,
+                        help="Penalty when edge length is outside ±10%% of rest (inequality)")
+    parser.add_argument("--w_width", type=float, default=0.0,
+                        help="Encourage mesh width (bbox x-extent); loss -= w_width*width")
+    parser.add_argument("--w_height", type=float, default=0.0,
+                        help="Encourage mesh height (bbox y-extent); loss -= w_height*height")
 
     # StiffFree3D-specific
     parser.add_argument("--k_xy", type=float, default=1.0,
@@ -474,19 +682,54 @@ if __name__ == "__main__":
     # Output
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory (auto-generated if not set)")
+    parser.add_argument("--plot_loss", action="store_true",
+                        help="If set, plot loss curves into output_dir at end of training")
 
     args = parser.parse_args()
 
-    # Auto-generate output_dir
+    # Auto-generate output_dir: penalties folder contains diag_penalty and other penalty subdirs
     if args.output_dir is None:
-        parts = ["checkpoints", args.mode]
-        if args.mesh != "grid":
-            parts.append(args.mesh)
+        parts = ["checkpoints"]
+        penalty_types = []
+        if getattr(args, "w_diag_planarity", 0.0) > 0.0:
+            penalty_types.append("diag_penalty")
+        if getattr(args, "w_inverse_diag", 0.0) > 0.0:
+            penalty_types.append("inverse_diag")
+        if getattr(args, "w_edge_length", 0.0) > 0.0:
+            penalty_types.append("edge_length")
+        if getattr(args, "w_edge_inequality_10", 0.0) > 0.0:
+            penalty_types.append("edge_inequality_10")
+        if getattr(args, "w_width", 0.0) > 0.0 or getattr(args, "w_height", 0.0) > 0.0:
+            penalty_types.append("width_height")
+        if penalty_types:
+            parts.append("penalties")
+            parts.append("+".join(penalty_types))
+        parts.append(args.mode)
+        if args.mesh_file:
+            mesh_part = "obj_" + os.path.splitext(os.path.basename(args.mesh_file))[0]
+        else:
+            mesh_part = args.mesh
+        if mesh_part != "grid":
+            parts.append(mesh_part)
         parts.append(f"d{args.latent_dim}")
         if args.mode == "free3d":
             parts.append(f"wp{args.w_planarity}")
         if args.mode == "stiffFree3d":
             parts.append(f"kxy{args.k_xy}_kz{args.k_z}")
+        def _fmt(x):
+            return f"{x:.0f}" if x == int(x) else str(x)
+        if getattr(args, "w_diag_planarity", 0.0) > 0.0:
+            parts.append(f"wdp{_fmt(args.w_diag_planarity)}")
+        if getattr(args, "w_inverse_diag", 0.0) > 0.0:
+            parts.append(f"winv{_fmt(args.w_inverse_diag)}")
+        if getattr(args, "w_edge_length", 0.0) > 0.0:
+            parts.append(f"wel{_fmt(args.w_edge_length)}")
+        if getattr(args, "w_edge_inequality_10", 0.0) > 0.0:
+            parts.append(f"weq10_{_fmt(args.w_edge_inequality_10)}")
+        if getattr(args, "w_width", 0.0) > 0.0:
+            parts.append(f"ww{_fmt(args.w_width)}")
+        if getattr(args, "w_height", 0.0) > 0.0:
+            parts.append(f"wh{_fmt(args.w_height)}")
         args.output_dir = os.path.join(*parts)
     print(f"Output directory: {args.output_dir}")
 

@@ -148,6 +148,21 @@ def main():
     num_verts = len(vertices_rest)
     edges = get_all_edges(faces)
 
+    # structural3d (and similar) outputs full 3D displacements: one (x,y,z)
+    # triplet per vertex. Treat any such checkpoint as a 3D mode in decode().
+    is_full_3d_output = (output_dim == num_verts * 3)
+
+    def set_front_view():
+        """
+        Set a \"front\" camera view: look at the mesh from -Y, with Z as up.
+        This avoids the default top-down view so the facade is visible.
+        """
+        center = vertices_rest.mean(axis=0)
+        bbox = vertices_rest.max(axis=0) - vertices_rest.min(axis=0)
+        radius = float(np.linalg.norm(bbox)) or 1.0
+        eye = center + np.array([0.0, -2.0 * radius, 0.5 * radius])
+        ps.look_at(center, eye)
+
     rest_lengths = np.linalg.norm(
         vertices_rest[edges[:, 1]] - vertices_rest[edges[:, 0]], axis=1
     )
@@ -242,7 +257,7 @@ def main():
             all_xy = pred.reshape(-1, 2)
             verts[:, 0] = all_xy[:, 0]
             verts[:, 1] = all_xy[:, 1]
-        elif mode in ("free3d", "stiffFree3d"):
+        elif mode in ("free3d", "stiffFree3d") or is_full_3d_output:
             verts[:, :] = pred.reshape(-1, 3)
         return verts
 
@@ -273,6 +288,8 @@ def main():
 
     # Face mesh (transparency applies here only)
     mesh_ps = ps.register_surface_mesh("quad_grid", vertices, faces, edge_width=0.0)
+    # Set an initial camera that looks at the mesh from the front instead of top-down.
+    set_front_view()
     mesh_ps.set_color(viz_state["mesh_color"])
 
     # Separate edge curve network (always opaque)
@@ -410,6 +427,10 @@ def main():
         if psim.Button("Reset to origin"):
             z_values[:] = 0.0
             changed = True
+
+        psim.SameLine()
+        if psim.Button("Reset view"):
+            set_front_view()
 
         psim.SameLine()
         if psim.Button("Random sample"):

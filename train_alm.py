@@ -111,7 +111,10 @@ def train_alm(args):
     if mesh_file_path:
         if mode in ("anchored", "free"):
             raise ValueError(f"Mode '{mode}' not supported for OBJ mesh")
-        vertices_rest, faces_np, interior_mask, bottom_lip_mask_np = load_obj(mesh_file_path)
+        vertices_rest, faces_np, interior_mask, bottom_lip_mask_np = load_obj(
+            mesh_file_path,
+            anchor_bottom_z=getattr(args, "floor_anchors", False),
+        )
         mesh_type = "obj"
     elif mesh_type == "grid":
         vertices_rest, faces_np, interior_mask = make_quad_grid(4, 4)
@@ -428,7 +431,10 @@ if __name__ == "__main__":
     # Same CLI surface as train.py
     parser.add_argument("--mesh", type=str, default="grid",
                         choices=["grid", "box", "semiTri", "hemiTri"])
-    parser.add_argument("--mesh_file", type=str, default=None)
+    parser.add_argument("--mesh_file", type=str, default=None,
+                        help="Path to OBJ file for generic mesh loading")
+    parser.add_argument("--floor_anchors", action="store_true",
+                        help="For OBJ meshes: freeze detected floor vertices (enable bottom anchors)")
     parser.add_argument("--mode", type=str, default="free3d",
                         choices=["anchored", "free", "free3d", "stiffFree3d", "old_diag_penalty"])
     parser.add_argument("--latent_dim", type=int, default=6)

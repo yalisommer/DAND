@@ -834,3 +834,143 @@ def assemble_vertices_torch(interior_xy, boundary_xy, interior_indices, num_vert
         full = full.squeeze(0)
 
     return full
+ 
+ 
+ 
+# =============================================================================
+# Face adjacency
+# =============================================================================
+ 
+def get_face_adjacency(faces_np):
+    """
+    Returns an int64 array of shape (P, 2) listing all adjacent face pairs.
+    Two faces are adjacent iff they share an undirected edge.
+    Works for quad, tri, or mixed meshes.
+    """
+    from collections import defaultdict
+    edge_to_faces = defaultdict(list)
+    for fi, face in enumerate(faces_np):
+        n = len(face)
+        for k in range(n):
+            e = tuple(sorted([int(face[k]), int(face[(k + 1) % n])]))
+            edge_to_faces[e].append(fi)
+    adj = [(fs[0], fs[1]) for fs in edge_to_faces.values() if len(fs) == 2]
+    if not adj:
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.array(adj, dtype=np.int64)
+ 
+ 
+# =============================================================================
+# Vaxman-style inter-face Dirichlet energy  (fully vectorised)
+# =============================================================================
+ 
+def compute_inter_face_dirichlet_torch(verts, faces, rest_verts, adj_pairs):
+    """
+    Inter-face Dirichlet energy following Vaxman (Modeling Polyhedral Meshes
+    with Affine Maps).
+ 
+    For each face a 3x3 deformation gradient F is computed from both edge and
+    diagonal vectors stacked into an overdetermined least-squares system:
+ 
+        F = (p_all.T @ r_all) @ inv(r_all.T @ r_all + reg*I)
+ 
+    The energy is:
+        E = sum_{(i,j) in adj_pairs}  ||F_i - F_j||_F^2
+ 
+    Fully vectorised — no Python loops over faces.
+ 
+    Parameters
+    ----------
+    verts      : (N, 3) current vertex positions
+    faces      : (F, 3|4) LongTensor
+    rest_verts : (N, 3) rest-state vertex positions
+    adj_pairs  : (P, 2) LongTensor of adjacent face index pairs
+ 
+    Returns
+    -------
+    scalar tensor
+    """
+    if adj_pairs.shape[0] == 0:
+        return torch.tensor(0.0, device=verts.device, dtype=verts.dtype)
+ 
+    is_quad = (faces.shape[1] == 4)
+ 
+    # --- Gather deformed and rest vertices for all faces at once ---
+    p0 = verts[faces[:, 0]]       # (F, 3)
+    p1 = verts[faces[:, 1]]
+    r0 = rest_verts[faces[:, 0]]  # (F, 3)
+    r1 = rest_verts[faces[:, 1]]
+ 
+    if is_quad:
+        p2 = verts[faces[:, 2]];      p3 = verts[faces[:, 3]]
+        r2 = rest_verts[faces[:, 2]]; r3 = rest_verts[faces[:, 3]]
+ 
+        # Stack 4 vectors per face: 2 edges + 2 diagonals → (F, 4, 3)
+        p_all = torch.stack([p1 - p0, p3 - p0, p2 - p0, p3 - p1], dim=1)
+        r_all = torch.stack([r1 - r0, r3 - r0, r2 - r0, r3 - r1], dim=1)
+    else:  # triangle
+        p2 = verts[faces[:, 2]]
+        r2 = rest_verts[faces[:, 2]]
+ 
+        # Stack 2 edge vectors per face → (F, 2, 3)
+        p_all = torch.stack([p1 - p0, p2 - p0], dim=1)
+        r_all = torch.stack([r1 - r0, r2 - r0], dim=1)
+ 
+    # --- Batched deformation gradient: F = p.T r (r.T r + reg I)^-1 ---
+    # r_all: (F, K, 3),  r_all.transpose(-1,-2): (F, 3, K)
+    gram = r_all.transpose(-1, -2) @ r_all   # (F, 3, 3)
+    reg  = 1e-6
+    gram = gram + reg * torch.eye(3, device=gram.device, dtype=gram.dtype).unsqueeze(0)
+    gram_inv = torch.linalg.inv(gram)        # (F, 3, 3)
+ 
+    # p_all.transpose(-1,-2): (F, 3, K) @ r_all (F, K, 3) = (F, 3, 3)
+    F_stack = p_all.transpose(-1, -2) @ r_all @ gram_inv   # (F, 3, 3)
+ 
+    # --- Vectorised pairwise Frobenius difference ---
+    diff = F_stack[adj_pairs[:, 0]] - F_stack[adj_pairs[:, 1]]   # (P, 3, 3)
+    return torch.sum(diff ** 2)
+ 
+ 
+# =============================================================================
+# Soft quadratic anti-collapse penalty  (fully vectorised)
+# =============================================================================
+ 
+def compute_area_anticollapse_torch(verts, faces, eps=0.01):
+    """
+    Soft quadratic penalty that fires when a face's unsigned area drops below
+    the threshold eps.
+ 
+        E = sum_i  max(0, eps - |area_i|)^2
+ 
+    Unsigned area is used intentionally: inverted faces are allowed as long as
+    they remain non-degenerate (consistent with aquadome-style inversions).
+ 
+    Fully vectorised — no Python loops over faces.
+ 
+    Parameters
+    ----------
+    verts  : (N, 3) current vertex positions
+    faces  : (F, 3|4) LongTensor
+    eps    : area threshold. Auto-set to ~15% of mean rest area in structural3d
+             training if --anticollapse_eps is not provided.
+ 
+    Returns
+    -------
+    scalar tensor
+    """
+    v0 = verts[faces[:, 0]]   # (F, 3)
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+ 
+    if faces.shape[1] == 4:
+        v3   = verts[faces[:, 3]]
+        # Two triangles per quad
+        a1   = 0.5 * torch.norm(torch.linalg.cross(v1 - v0, v2 - v0), dim=1)  # (F,)
+        a2   = 0.5 * torch.norm(torch.linalg.cross(v2 - v0, v3 - v0), dim=1)
+        areas = a1 + a2
+    else:  # triangle
+        areas = 0.5 * torch.norm(torch.linalg.cross(v1 - v0, v2 - v0), dim=1)  # (F,)
+ 
+    violations = torch.clamp(eps - areas, min=0.0)   # (F,) — only fires below eps
+    return torch.sum(violations ** 2)
+ 
